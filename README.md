@@ -1,6 +1,6 @@
 # DNAmExpress-WGR
 
-**DNAmExpress-WGR** is a reproducible pipeline for integrated analysis of DNA methylation (DNAm) and whole-gene RNA expression (WGR) data. It supports both bulk and single-cell workflows and is designed for studies involving exposure models and developmental epigenetics.
+**DNAmExpress-WGR** is a reproducible pipeline for integrated analysis of whole-genome DNA methylation (DNAm) and RNA expression data focused on intronic regions and repeat elements. 
 
 ## Features
 
@@ -29,12 +29,13 @@
    - DMR analysis: methylKit or DSS
    - Exploratory methylation/coverage analysis with [SeqMonk](https://www.bioinformatics.babraham.ac.uk/projects/seqmonk/) (Babraham Institute)
 
-5. **Integration**
+
 6. **Genomic Feature Enrichment**
    - Analysis of methylation and expression patterns across genomic features such as **repeats** (LINEs, SINEs, LTRs) and **introns**
    - Uses RepeatMasker (open-4.0.5) and UCSC mm10 (GRCm38) genome annotations for intron boundaries [(Kent et al., 2002)](https://doi.org/10.1101/gr.229102)
    - Outputs include feature-level heatmaps and summary tables
 
+5. **Integration**
    - Correlation between methylation and expression
    - Visualizations (heatmaps, PCA, volcano plots)
 
