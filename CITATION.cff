@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use DNAmExpress-WGR in your work, please cite it as below."
+title: "DNAmExpress-WGR: A reproducible pipeline for integrative whole DNA methylation and RNA expression analysis"
+authors:
+  - family-names: Zakarya
+    given-names: Razia
+    affiliation: University of Technology Sydney
+    affiliation: Woolcock Institute of Medical Research
+    orcid: https://orcid.org/0000-0002-9259-9369
+date-released: 2025-06-11
+version: 1.0.0
+license: MIT
+repository-code: https://github.com/RazZak186/DNAmExpress-WGR
