@@ -1,0 +1,65 @@
+name: DNAmExpress-WGR Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Install Miniconda
+      - name: Setup Conda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          auto-activate-base: false
+          activate-environment: dnamexpress-wgr
+          environment-file: environment.yml
+          use-mamba: true
+
+      # Cache conda environment to speed up runs
+      - name: Cache conda packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.conda/pkgs
+            ~/conda_pkgs_dir
+          key: ${{ runner.os }}-conda-${{ hashFiles('environment.yml') }}
+
+      - name: Print versions
+        shell: bash -l {0}
+        run: |
+          python --version
+          snakemake --version
+
+      # Create minimal test directories if none exist
+      - name: Prepare directories
+        run: |
+          mkdir -p data results logs
+
+      # Run the pipeline
+      - name: Run DNAmExpress-WGR
+        shell: bash -l {0}
+        run: |
+          snakemake \
+            --use-conda \
+            --cores 2 \
+            --printshellcmds \
+            --rerun-incomplete
+
+      # Upload results
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pipeline-results
+          path: |
+            results/**
+            logs/**
