@@ -1,0 +1,86 @@
+name: Run pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: "Pipeline config file path"
+        required: true
+        default: "configs/pipeline.yaml"
+      target:
+        description: "Optional step/target to run up to (leave blank for full run)"
+        required: false
+        default: ""
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- Option A: if your pipeline uses Conda ----
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          auto-activate-base: false
+          activate-environment: pipeline
+          environment-file: env/environment.yml
+          use-mamba: true
+
+      - name: Cache conda packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.conda/pkgs
+            /usr/share/miniconda/pkgs
+            /opt/conda/pkgs
+          key: conda-${{ runner.os }}-${{ hashFiles('env/environment.yml') }}
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh || true
+
+      - name: Run pipeline
+        env:
+          PIPELINE_CONFIG: ${{ inputs.config || 'configs/pipeline.yaml' }}
+          PIPELINE_TARGET: ${{ inputs.target }}
+        shell: bash -l {0}
+        run: |
+          set -euo pipefail
+          echo "Config: ${PIPELINE_CONFIG}"
+          echo "Target: ${PIPELINE_TARGET}"
+          if [[ -n "${PIPELINE_TARGET}" ]]; then
+            bash scripts/run_pipeline.sh "${PIPELINE_CONFIG}" "${PIPELINE_TARGET}"
+          else
+            bash scripts/run_pipeline.sh "${PIPELINE_CONFIG}"
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            logs/**
+            **/*.log
+          if-no-files-found: warn
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results
+          path: |
+            results/**
+            output/**
+            reports/**
+          if-no-files-found: warn
