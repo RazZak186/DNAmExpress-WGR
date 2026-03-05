@@ -1,0 +1,401 @@
+import os
+
+SAMPLES = ["sample1", "sample2"]
+
+rule all:
+    input:
+        expand("results/qc/{sample}_fastqc.html", sample=SAMPLES),
+        expand("results/alignment/{sample}.bam", sample=SAMPLES),
+        "results/expression/gene_counts.txt",
+        "results/methylation/methylation_matrix.txt"
+
+
+################################
+# QC
+################################
+
+rule fastqc:
+    input:
+        "data/{sample}.fastq.gz"
+    output:
+        "results/qc/{sample}_fastqc.html"
+    conda:
+        "../envs/fastqc.yml"
+    shell:
+        """
+        fastqc {input} --outdir results/qc
+        """
+
+
+################################
+# Trimming
+################################
+
+rule trim_galore:
+    input:
+        "data/{sample}.fastq.gz"
+    output:
+        "results/trimmed/{sample}_trimmed.fq.gz"
+    conda:
+        "../envs/trim_galore.yml"
+    shell:
+        """
+        trim_galore {input} -o results/trimmed
+        """
+
+
+################################
+# RNA alignment
+################################
+
+rule star_align:
+    input:
+        "results/trimmed/{sample}_trimmed.fq.gz"
+    output:
+        "results/alignment/{sample}.bam"
+    conda:
+        "../envs/star.yml"
+    shell:
+        """
+        STAR \
+        --readFilesIn {input} \
+        --outFileNamePrefix results/alignment/{wildcards.sample}_ \
+        --outSAMtype BAM SortedByCoordinate
+        """
+
+
+################################
+# Expression quantification
+################################
+
+rule featurecounts:
+    input:
+        expand("results/alignment/{sample}.bam", sample=SAMPLES)
+    output:
+        "results/expression/gene_counts.txt"
+    conda:
+        "../envs/subread.yml"
+    shell:
+        """
+        featureCounts \
+        -a annotation.gtf \
+        -o {output} \
+        {input}
+        """
+
+
+################################
+# WGBS alignment
+################################
+
+rule bismark_align:
+    input:
+        "results/trimmed/{sample}_trimmed.fq.gz"
+    output:
+        "results/methylation/{sample}_bismark.bam"
+    conda:
+        "../envs/bismark.yml"
+    shell:
+        """
+        bismark genome/ {input} -o results/methylation
+        """
+
+
+################################
+# Methylation extraction
+################################
+
+rule methylation_extract:
+    input:
+        expand("results/methylation/{sample}_bismark.bam", sample=SAMPLES)
+    output:
+        "results/methylation/methylation_matrix.txt"
+    conda:
+        "../envs/bismark.yml"
+    shell:
+        """
+        bismark_methylation_extractor \
+        --comprehensive \
+        --output results/methylation \
+        {input}
+        """
+################################
+# RepeatMasker + feature enrichment
+################################
+
+import pandas as pd
+
+configfile: "configs/config.yaml"
+
+SAMPLES = config["samples"]
+
+REF_FA = config["reference_fasta"]          # e.g., "resources/mm10.fa"
+GTF    = config["annotation_gtf"]           # e.g., "resources/mm10.gtf"
+RM_LIB = config.get("repeatmasker_lib", "") # optional: custom library if needed
+
+# Where RepeatMasker will write (RepeatMasker creates multiple files; .out is key)
+RM_OUT = "resources/repeatmasker/mm10.fa.out"
+RM_BED = "resources/repeatmasker/repeats.bed"
+RM_FAM = "resources/repeatmasker/repeat_families.tsv"
+
+INTRON_BED = "resources/features/introns.bed"
+
+# Expected per-sample CpG methylation calls in BED-ish format:
+# chrom  start  end  meth_frac  cov  (you can adjust columns in downstream awk)
+CPG_BED = "results/methylation/{sample}/cpg_calls.bed.gz"
+
+REPEAT_METH_TSV = "results/enrichment/repeats/methylation_by_family.tsv"
+INTRON_REPEAT_METH_TSV = "results/enrichment/introns_repeats/methylation_by_family.tsv"
+
+rule all:
+    input:
+        # your existing outputs...
+        RM_BED,
+        RM_FAM,
+        INTRON_BED,
+        REPEAT_METH_TSV,
+        INTRON_REPEAT_METH_TSV
+
+
+# --- Run RepeatMasker (or skip if you commit precomputed .out and set use_precomputed: true) ---
+rule repeatmasker_run:
+    input:
+        fa=REF_FA
+    output:
+        out=RM_OUT
+    params:
+        outdir="resources/repeatmasker",
+        species=config.get("repeatmasker_species", "mouse"),
+        threads=config.get("threads", 4),
+        use_precomputed=config.get("repeatmasker_use_precomputed", False),
+        lib=RM_LIB
+    conda:
+        "envs/repeatmasker.yml"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {params.outdir}
+
+        if [ "{params.use_precomputed}" = "True" ] && [ -s "{output.out}" ]; then
+          echo "[RepeatMasker] using precomputed: {output.out}"
+          exit 0
+        fi
+
+        # RepeatMasker writes outputs next to the fasta unless -dir is used
+        # Use -species for Dfam; custom libraries vary by setup
+        if [ -n "{params.lib}" ]; then
+          RepeatMasker -pa {params.threads} -dir {params.outdir} -lib "{params.lib}" "{input.fa}"
+        else
+          RepeatMasker -pa {params.threads} -dir {params.outdir} -species "{params.species}" "{input.fa}"
+        fi
+
+        # Normalize output name (RepeatMasker typically writes <fa>.out)
+        # This assumes your fasta filename is mm10.fa (adjust if needed)
+        # If RepeatMasker output already equals desired path, this is harmless.
+        if [ ! -s "{output.out}" ]; then
+          # try to find the first .out created in outdir
+          OUTFILE=$(ls -1 {params.outdir}/*.out | head -n 1)
+          cp "$OUTFILE" "{output.out}"
+        fi
+        """
+
+
+# --- Convert RepeatMasker .out to BED ---
+# BED columns: chrom start end name class/family strand score(perc_div)
+rule repeatmasker_out_to_bed:
+    input:
+        out=RM_OUT
+    output:
+        bed=RM_BED
+    conda:
+        "envs/bedtools.yml"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.bed})
+
+        # RepeatMasker .out has 3 header lines then fixed columns.
+        # We emit:
+        #   chrom  start  end  repName|repClass/repFamily  perc_div  strand
+        awk 'BEGIN{{OFS="\t"}} NR>3 {{
+              chrom=$5; start=$6-1; end=$7; strand=$9;
+              repName=$10; repClassFam=$11;
+              percdiv=$2;
+              name=repName "|" repClassFam;
+              print chrom,start,end,name,percdiv,strand
+        }}' {input.out} \
+        | sort -k1,1 -k2,2n > {output.bed}
+        """
+
+
+# --- Summarize repeats present in genome (family counts) ---
+rule repeatmasker_family_table:
+    input:
+        bed=RM_BED
+    output:
+        tsv=RM_FAM
+    conda:
+        "envs/python.yml"
+    shell:
+        r"""
+        set -euo pipefail
+        python - <<'PY'
+import pandas as pd
+
+bed = pd.read_csv("{input.bed}", sep="\t", header=None,
+                  names=["chrom","start","end","name","percdiv","strand"])
+# name = repName|repClass/repFamily
+rep = bed["name"].str.split("|", n=1, expand=True)
+bed["repName"] = rep[0]
+bed["repClassFam"] = rep[1].fillna("NA")
+cls = bed["repClassFam"].str.split("/", n=1, expand=True)
+bed["repClass"] = cls[0].fillna("NA")
+bed["repFamily"] = cls[1].fillna("NA")
+
+tab = (bed.groupby(["repClass","repFamily"])
+          .size()
+          .reset_index(name="count")
+          .sort_values(["repClass","repFamily","count"], ascending=[True,True,False]))
+
+tab.to_csv("{output.tsv}", sep="\t", index=False)
+PY
+        """
+
+
+# --- Build introns BED from GTF (simple and reproducible) ---
+# This creates introns by taking gene span minus exons per transcript.
+# For complex annotation choices, you can swap this for a more specific intron definition.
+rule gtf_to_introns_bed:
+    input:
+        gtf=GTF
+    output:
+        bed=INTRON_BED
+    conda:
+        "envs/bedtools.yml"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.bed})
+
+        # Extract exons (BED6)
+        awk 'BEGIN{{OFS="\t"}} $3=="exon" {{
+            chrom=$1; start=$4-1; end=$5; strand=$7;
+            # transcript_id is the most useful unit for introns
+            match($0, /transcript_id "([^"]+)"/, a);
+            tid=(a[1] ? a[1] : "NA");
+            print chrom,start,end,tid,0,strand
+        }}' {input.gtf} \
+        | sort -k1,1 -k2,2n > resources/features/exons.bed
+
+        # Merge exons per transcript then take gaps as introns using bedtools complement within transcript span.
+        # We approximate transcript span as merged exon span (works well for most use; strict spans require transcript features).
+        # 1) get transcript spans as min(start) to max(end) per transcript
+        awk 'BEGIN{{OFS="\t"}} {{
+          tid=$4;
+          if (!(tid in minS) || $2 < minS[tid]) minS[tid]=$2;
+          if (!(tid in maxE) || $3 > maxE[tid]) maxE[tid]=$3;
+          chr[tid]=$1; str[tid]=$6;
+        }} END {{
+          for (tid in chr) print chr[tid], minS[tid], maxE[tid], tid, 0, str[tid];
+        }}' resources/features/exons.bed \
+        | sort -k1,1 -k2,2n > resources/features/transcript_spans.bed
+
+        # 2) subtract merged exons from transcript spans → introns
+        bedtools sort -i resources/features/exons.bed \
+          | bedtools merge -i - -c 4,6 -o distinct,distinct > resources/features/exons.merged.bed
+
+        # bedtools subtract expects matching coordinates; we keep transcript_id in col4 where possible
+        bedtools subtract -a resources/features/transcript_spans.bed -b resources/features/exons.merged.bed \
+          | awk 'BEGIN{{OFS="\t"}} $3>$2 {{print $1,$2,$3,$4,$5,$6}}' \
+          | sort -k1,1 -k2,2n > {output.bed}
+        """
+
+
+# --- Intersect CpGs with repeats and summarize methylation by repeat family ---
+rule methylation_by_repeat_family:
+    input:
+        repeats=RM_BED,
+        cpgs=expand(CPG_BED, sample=SAMPLES)
+    output:
+        tsv=REPEAT_METH_TSV
+    conda:
+        "envs/bedtools.yml"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.tsv})
+
+        # Combine all sample CpGs into one stream: chrom start end meth_frac cov sample
+        # Expect cpg_calls.bed.gz columns:
+        #   1 chrom, 2 start, 3 end, 4 meth_frac, 5 cov
+        zcat {input.cpgs} \
+        | awk 'BEGIN{{OFS="\t"}} {{
+            # sample name is encoded by parent folder in this pipeline; adjust if needed
+            print $1,$2,$3,$4,$5
+        }}' > work/all_cpgs.bed
+
+        # Intersect CpGs with repeats. Keep repeat annotation from repeats.bed (col4 = repName|class/family)
+        bedtools intersect -a work/all_cpgs.bed -b {input.repeats} -wa -wb \
+        | awk 'BEGIN{{OFS="\t"}}
+               {{
+                 meth=$4; cov=$5; rep=$9;  # rep annotation in repeats.bed col4 -> becomes field 9 here
+                 # split rep into repName|class/family then class/family
+                 split(rep, a, "|"); classfam=a[2];
+                 split(classfam, b, "/"); repClass=b[1]; repFamily=(b[2] ? b[2] : "NA");
+                 key=repClass "\t" repFamily;
+                 n[key] += 1;
+                 sumMeth[key] += meth;
+                 sumCov[key] += cov;
+               }}
+               END{{
+                 print "repClass","repFamily","nCpGs","meanMethFrac","sumCoverage";
+                 for (k in n){
+                   split(k, z, "\t");
+                   print z[1],z[2],n[k],(sumMeth[k]/n[k]),sumCov[k];
+                 }
+               }}' \
+        | sort -k1,1 -k2,2 > {output.tsv}
+        """
+
+
+# --- Optional: intron ∩ repeats enrichment (focus on intronic repeat elements) ---
+rule methylation_by_repeat_family_in_introns:
+    input:
+        repeats=RM_BED,
+        introns=INTRON_BED,
+        cpgs=expand(CPG_BED, sample=SAMPLES)
+    output:
+        tsv=INTRON_REPEAT_METH_TSV
+    conda:
+        "envs/bedtools.yml"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.tsv})
+
+        # repeats within introns
+        bedtools intersect -a {input.repeats} -b {input.introns} -wa \
+        | sort -k1,1 -k2,2n > work/repeats_in_introns.bed
+
+        zcat {input.cpgs} > work/all_cpgs.bed
+
+        bedtools intersect -a work/all_cpgs.bed -b work/repeats_in_introns.bed -wa -wb \
+        | awk 'BEGIN{{OFS="\t"}}
+               {{
+                 meth=$4; cov=$5; rep=$9;
+                 split(rep, a, "|"); classfam=a[2];
+                 split(classfam, b, "/"); repClass=b[1]; repFamily=(b[2] ? b[2] : "NA");
+                 key=repClass "\t" repFamily;
+                 n[key] += 1;
+                 sumMeth[key] += meth;
+                 sumCov[key] += cov;
+               }}
+               END{{
+                 print "repClass","repFamily","nCpGs","meanMethFrac","sumCoverage";
+                 for (k in n){
+                   split(k, z, "\t");
+                   print z[1],z[2],n[k],(sumMeth[k]/n[k]),sumCov[k];
+                 }
+               }}' \
+        | sort -k1,1 -k2,2 > {output.tsv}
+        """
